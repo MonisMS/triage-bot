@@ -1,7 +1,10 @@
 import 'dotenv/config' ;
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import OpenAI from 'openai';
 
-
+const run = promisify(execFile)
+const repoPath = process.env.REPO_PATH
 const readApiKey = (apiKey:string|undefined):string =>{
 if(!apiKey){
     throw new Error("GOOGLE_API_KEY is missing. Set it in .env");
@@ -52,12 +55,22 @@ Answer in this shape:
 
 Be explicit about uncertainty. If you are guessing because you have not seen
 the code, say so and say what you would need to look at to be sure.`
-const response = await client.chat.completions.create({
-    model:"gemini-3.6-flash",
-    messages:[
-        {role: 'system',content:systemPrompt},
-        {role : 'user',content:issue}
-    ]
-})
 
-console.log(response.choices[0]?.message.content);
+// const response = await client.chat.completions.create({
+//     model:"gemini-3.6-flash",
+//     messages:[
+//         {role: 'system',content:systemPrompt},
+//         {role : 'user',content:issue}
+//     ]
+// })
+
+// console.log(response.choices[0]?.message.content);
+
+const searchCode =async (query:string): Promise<string> => {
+    
+    const {stdout,stderr} = await run("rg",["--files-with-matches", query,"."],{cwd:repoPath})
+    return stdout.split("\n").slice(0, 20).join("\n");
+}
+console.log("before");
+console.log(await searchCode("plugin"));
+console.log("after");
