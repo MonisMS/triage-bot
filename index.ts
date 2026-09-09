@@ -25,7 +25,7 @@ const client = new OpenAI({
 
 })
 
-const MODEL = "gemini-3.1-flash-lite"
+const MODEL = "gemini-3.8-flash"
 
 const issue = `What API or service would you like integrated?
 Code Interpreter
@@ -76,12 +76,27 @@ not guess another path. Use search_code to find the right one.
 Do not claim a file or directory is missing unless you have listed its parent
 directory and it was not there.
 
+If the issue names a feature such as webhooks, authentication, or tests, confirm
+that any example you recommend actually implements it. List its directory. An
+example only demonstrates a feature if there are files implementing it, such as
+a dedicated directory or non-empty definitions. A field set to {} or undefined
+is not an example of anything. Do not assume a file handles something because it
+would make sense for it to.
+
+Before telling the developer to create files by hand, list the scripts directory
+and check whether a scaffolding or generator script already exists for this kind
+of work.
+
 Prefer reading a directory's files over guessing what they contain. If you are
 about to write "likely contains" or "should contain", read the file instead.
 
 Do not write the fix. Do not output code, patches, shell commands, or
 implementations. If you find yourself writing a function, you have
 misunderstood the task.
+
+Your concrete first step must be something you have not already done. If you
+have read a file during this session, do not tell the developer to read it as
+their first step. Tell them what you found in it.
 
 Once you have enough to name the files, stop searching and answer in this shape:
 - What the issue is actually asking for, in one or two sentences.
@@ -153,10 +168,13 @@ const messages:OpenAI.Chat.ChatCompletionMessageParam[] = [
 const searchCode =async (query:string): Promise<string> => {
     
     try {
-        const {stdout} = await run("rg",["--files-with-matches", query,"."],{cwd:repoPath})
-    return stdout.split("\n").slice(0, 20).join("\n");
+        const {stdout} = await run("rg",["--files-with-matches","--hidden", query,"."],{cwd:repoPath})
+        const lines = stdout.trim().split("\n")
+        const shown = lines.slice(0, 20)
+        return shown.join("\n") +
+            (lines.length > 20 ? `\n... ${lines.length - 20} more files not shown` : "")
     } catch (error) {
-        return "no files matched"
+        return `ERROR: no files matched: ${query}`
     }
 }
 
@@ -176,19 +194,48 @@ const readFileTool = async(path:string):Promise<string> =>{
     try {
         const fullPath = join(repoPath,path)
         const readPath = await readFile(fullPath,"utf-8")
-        const content = readPath.split("\n").slice(0,100).join("\n")
-        return content
+        const lines = readPath.split("\n")
+        const shown = lines.slice(0, 100)
+        return shown.join("\n") +
+            (lines.length > 100 ? `\n... ${lines.length - 100} more lines not shown` : "")
     } catch (error) {
-        return "no such file exists"
+        return `ERROR: no such file: ${path}`
     }
 }
+const MAX_TURNS = 10
+const WARN_AT = 3
+const PACE_MS = 13_000
+
+const sleep = (ms:number) => new Promise(r => setTimeout(r, ms))
+
 let answered = false;
-for (let i = 0; i < 10; i++) {
-    console.log(`[${i}] calling model...`);
+for (let i = 0; i < MAX_TURNS; i++) {
+    const turnsLeft = MAX_TURNS - 1 - i
+    const isLastTurn = turnsLeft === 0
+
+    if (turnsLeft === WARN_AT) {
+        messages.push({
+            role: "user",
+            content: `You have ${WARN_AT} tool calls left. Start narrowing down and be ready to answer.`,
+        })
+    }
+    if (isLastTurn) {
+        messages.push({
+            role: "user",
+            content: "No tool calls remain. Answer now with what you have found so far. " +
+                "If something is still unconfirmed, say so plainly rather than guessing.",
+        })
+    }
+
+    if (i > 0) {
+        await sleep(PACE_MS)
+    }
+
+    console.log(`[${i}] calling model...${isLastTurn ? " (final, no tools)" : ""}`);
     const response = await client.chat.completions.create({
         model: MODEL,
         messages,
-        tools,
+        ...(isLastTurn ? {} : { tools }),
     })
     const message = response.choices[0]?.message
     if(!message){
