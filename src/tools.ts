@@ -7,15 +7,6 @@ import { z } from "zod"
 
 const run = promisify(execFile)
 
-export const readEnv = (envVar: string | undefined, varName: string): string => {
-    if (!envVar) {
-        throw new Error(`${varName} is missing. Set it in .env`)
-    }
-    return envVar
-}
-
-const repoPath = readEnv(process.env.REPO_PATH, "REPO_PATH")
-
 export const INVALID_CALL = "INVALID_CALL:"
 export const TOOL_ERROR = "ERROR:"
 
@@ -56,6 +47,16 @@ export const ListFileSchema = z.object({
         .default("."),
 })
 
+export const RecentChangesSchema = z.object({
+    path: z
+        .string()
+        .min(1, "path must not be empty")
+        .describe(
+            "Path to a file or directory, relative to the repository root, e.g. 'packages/corsair/core/constants.ts' or 'packages/corsair'."
+        )
+        .refine(insideRepo, insideRepoMessage),
+})
+
 export const toolParams = (schema: z.ZodType<any, any>) => {
     const { $schema, ...rest } = z.toJSONSchema(schema, { io: "input" }) as Record<string, unknown>
     return rest
@@ -80,6 +81,16 @@ export const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
             "Takes a path relative to the repository root. " +
             "Use this after search_code to confirm what a file actually contains before recommending it.",
             parameters: toolParams(ReadFileSchema),
+        },
+    },
+    {
+        type: "function",
+        function: {
+            name: "recent_changes",
+            description: "Show the last 5 commits that touched a file or directory, with the short hash, author, relative date and subject. " +
+            "Takes a path relative to the repository root. " +
+            "Use this to find who last worked on an area and how recently, before recommending it to the developer.",
+            parameters: toolParams(RecentChangesSchema),
         },
     },
     {
@@ -117,7 +128,7 @@ const assertSpawned = (error: unknown, binary: string): void => {
     }
 }
 
-export const searchCode = async (query: string): Promise<string> => {
+export const searchCode = async (repoPath: string, query: string): Promise<string> => {
     try {
         const { stdout } = await run(
             "rg",
@@ -136,7 +147,7 @@ export const searchCode = async (query: string): Promise<string> => {
     }
 }
 
-export const listFiles = async (path: string = "."): Promise<string> => {
+export const listFiles = async (repoPath: string, path: string = "."): Promise<string> => {
     try {
         const { stdout } = await run("ls", ["-1p", "--", path], { cwd: repoPath })
         const lines = stdout.trim().split("\n").filter(Boolean)
@@ -151,7 +162,7 @@ export const listFiles = async (path: string = "."): Promise<string> => {
     }
 }
 
-export const readFileTool = async (path: string): Promise<string> => {
+export const readFileTool = async (repoPath: string, path: string): Promise<string> => {
     try {
         const contents = await readFile(join(repoPath, path), "utf-8")
         if (contents.trim() === "") return `(empty file: ${path})`
@@ -162,6 +173,23 @@ export const readFileTool = async (path: string): Promise<string> => {
         if (code === "EISDIR") return `${TOOL_ERROR} that path is a directory, not a file: ${path}`
         if (code === "EACCES") return `${TOOL_ERROR} permission denied: ${path}`
         return `${TOOL_ERROR} could not read ${path}: ${code ?? String(error)}`
+    }
+}
+
+export const recentChanges = async (repoPath: string, path: string): Promise<string> => {
+    try {
+        const { stdout } = await run(
+            "git",
+            ["log", "-n", "5", "--format=%h  %an, %ar:  %s", "--", path],
+            { cwd: repoPath },
+        )
+        const lines = stdout.trim().split("\n").filter(Boolean)
+        if (lines.length === 0) return `(no commits found for: ${path})`
+        return truncate(lines, 5, "commits")
+    } catch (error) {
+        assertSpawned(error, "git")
+        const detail = ((error as { stderr?: string }).stderr ?? String(error)).trim()
+        return `${TOOL_ERROR} could not read history for ${path}: ${detail}`
     }
 }
 

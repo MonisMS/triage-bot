@@ -22,6 +22,8 @@ export type RoundLog = {
 export type RunLog = {
     startedAt: string
     model: string
+    repo: string
+    issueNumber: number
     issue: string
     systemPrompt: string
     rounds: RoundLog[]

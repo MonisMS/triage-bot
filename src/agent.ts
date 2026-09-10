@@ -1,19 +1,28 @@
 import OpenAI from "openai"
+import type { IssueRef } from "./github.js"
 import { writeRunLog, type Outcome, type RoundLog, type RunLog } from "./log.js"
 import { systemPrompt } from "./prompt.js"
 import {
     INVALID_CALL,
     ListFileSchema,
     ReadFileSchema,
+    RecentChangesSchema,
     SearchCodeSchema,
     TOOL_ERROR,
     listFiles,
-    readEnv,
     readFileTool,
+    recentChanges,
     searchCode,
     tools,
     withArgs,
 } from "./tools.js"
+
+const readEnv = (envVar: string | undefined, varName: string): string => {
+    if (!envVar) {
+        throw new Error(`${varName} is missing. Set it in .env`)
+    }
+    return envVar
+}
 
 const client = new OpenAI({
     apiKey: readEnv(process.env.GOOGLE_API_KEY, "GOOGLE_API_KEY"),
@@ -22,7 +31,7 @@ const client = new OpenAI({
     maxRetries: 0,
 })
 
-const MODEL = "gemini-3.7-flash"
+const MODEL = "gemini-3.6-flash"
 
 const MAX_TURNS = 6
 const WARN_AT = 2
@@ -30,7 +39,33 @@ const PACE_MS = 13_000
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
-export const runAgent = async (issueText: string): Promise<string | null> => {
+const RETRY_STATUSES = new Set([500, 502, 503, 504])
+const MAX_ATTEMPTS = 3
+const BACKOFF_MS = 2_000
+
+const createWithRetry = async (
+    body: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming,
+): Promise<OpenAI.Chat.ChatCompletion> => {
+    for (let attempt = 1; ; attempt++) {
+        try {
+            return await client.chat.completions.create(body)
+        } catch (error) {
+            const status = (error as { status?: number }).status
+            if (status === undefined || !RETRY_STATUSES.has(status) || attempt >= MAX_ATTEMPTS) {
+                throw error
+            }
+            const waitMs = BACKOFF_MS * attempt
+            console.log(`  ${status} from the model, retrying in ${waitMs / 1000}s (attempt ${attempt + 1}/${MAX_ATTEMPTS})`)
+            await sleep(waitMs)
+        }
+    }
+}
+
+export const runAgent = async (
+    issueText: string,
+    repoPath: string,
+    ref: IssueRef,
+): Promise<string | null> => {
     const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
         { role: "system", content: systemPrompt },
         { role: "user", content: issueText },
@@ -39,6 +74,8 @@ export const runAgent = async (issueText: string): Promise<string | null> => {
     const runLog: RunLog = {
         startedAt: new Date().toISOString(),
         model: MODEL,
+        repo: `${ref.owner}/${ref.repo}`,
+        issueNumber: ref.number,
         issue: issueText,
         systemPrompt,
         rounds: [],
@@ -70,7 +107,7 @@ export const runAgent = async (issueText: string): Promise<string | null> => {
             }
 
             console.log(`[${i}] calling model...${isLastTurn ? " (final, no tools)" : ""}`)
-            const response = await client.chat.completions.create({
+            const response = await createWithRetry({
                 model: MODEL,
                 messages,
                 ...(isLastTurn ? {} : { tools }),
@@ -114,9 +151,10 @@ export const runAgent = async (issueText: string): Promise<string | null> => {
                 const raw = call.function.arguments
 
                 const result =
-                    name === "search_code" ? await withArgs(SearchCodeSchema, raw, (a) => searchCode(a.query))
-                    : name === "read_file" ? await withArgs(ReadFileSchema, raw, (a) => readFileTool(a.path))
-                    : name === "list_files" ? await withArgs(ListFileSchema, raw, (a) => listFiles(a.path))
+                    name === "search_code" ? await withArgs(SearchCodeSchema, raw, (a) => searchCode(repoPath, a.query))
+                    : name === "read_file" ? await withArgs(ReadFileSchema, raw, (a) => readFileTool(repoPath, a.path))
+                    : name === "list_files" ? await withArgs(ListFileSchema, raw, (a) => listFiles(repoPath, a.path))
+                : name === "recent_changes" ? await withArgs(RecentChangesSchema, raw, (a) => recentChanges(repoPath, a.path))
                     : `${INVALID_CALL} unknown tool ${name}`
 
                 const outcome: Outcome = result.startsWith(INVALID_CALL)

@@ -1,35 +1,26 @@
 import "dotenv/config"
 import { pathToFileURL } from "node:url"
 import { runAgent } from "./agent.js"
+import { ensureClone } from "./clone.js"
+import { fetchIssue, parseIssueRef } from "./github.js"
 
-export const issue = `What API or service would you like integrated?
-Code Interpreter
+const main = async (input: string | undefined): Promise<void> => {
+    if (!input) {
+        console.error("usage: pnpm dev <github issue url | owner/repo#123>")
+        console.error("  e.g. pnpm dev https://github.com/owner/repo/issues/123")
+        console.error("       pnpm dev owner/repo#123")
+        process.exit(1)
+    }
 
-API documentation link
-https://www.librechat.ai/docs/features/code_interpreter
+    const ref = parseIssueRef(input)
+    console.log(`issue: ${ref.owner}/${ref.repo}#${ref.number}`)
 
-What would you like to do with this integration?
-Code Interpreter API is a tool that allows an AI application to execute code, analyze data, and work with files in a controlled environment. It is especially useful for tasks involving Python programming, data analysis, calculations, charts, and file processing.
+    const issueText = await fetchIssue(ref)
+    const repoPath = await ensureClone(ref.owner, ref.repo)
 
-Key features:
-
-Execute Python code
-Analyze CSV, Excel, and other data files
-Create graphs and visualizations
-Perform complex calculations
-Read and process uploaded files
-Help automate data-analysis tasks
-
-Do you need webhook support?
-
-Yes, I need webhook support for this integration
-
-Webhook details (if applicable)
-No response
-
-Additional context
-No response`
+    await runAgent(issueText, repoPath, ref)
+}
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-    await runAgent(issue)
+    await main(process.argv[2])
 }
