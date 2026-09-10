@@ -31,7 +31,7 @@ const client = new OpenAI({
     maxRetries: 0,
 })
 
-const MODEL = "gemini-3.6-flash"
+const MODEL = "gemini-3.8-flash"
 
 const MAX_TURNS = 6
 const WARN_AT = 2
