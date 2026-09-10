@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import OpenAI from 'openai';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { z } from 'zod';
 
 const run = promisify(execFile)
@@ -20,7 +21,9 @@ const repoPath = readEnv(process.env.REPO_PATH, "REPO_PATH");
 
 const client = new OpenAI({
     apiKey:readEnv(process.env.GOOGLE_API_KEY, "GOOGLE_API_KEY"),
-    baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/",
+    // Overridable so the loop can be driven against a local stub server without
+    // spending real quota. Unset in normal use.
+    baseURL: process.env.BASE_URL ?? "https://generativelanguage.googleapis.com/v1beta/openai/",
     timeout: 120_000,
     maxRetries: 3,
 
@@ -111,11 +114,15 @@ you would need to look at next.`
 
 
 // A path the model supplies must stay inside repoPath. `cwd` does not enforce
-// this: `ls ../..` resolves relative to cwd and walks straight out of the repo,
-// and join(repoPath, "../..") does the same. Neither TypeScript nor JSON Schema
-// can express this, so it lives in a refinement that runs on our side.
-const insideRepo = (p: string) => !p.split(/[\\/]/).includes("..")
-const insideRepoMessage = "path must stay inside the repository: no '..' segments"
+// this: `ls ../..` walks straight out of the repo, and an absolute path ignores
+// cwd entirely, while join(repoPath, "/etc") resolves to "/etc". Neither
+// TypeScript nor JSON Schema can express this, so it runs on our side.
+const insideRepo = (p: string) =>
+    !p.startsWith("/") &&
+    !/^[A-Za-z]:/.test(p) &&
+    !p.split(/[\\/]/).includes("..")
+const insideRepoMessage =
+    "path must be relative to the repository root: no leading '/', no drive letter, no '..' segments"
 
 const SearchCodeSchema = z.object({
     query: z
@@ -145,10 +152,7 @@ const ListFileSchema = z.object({
         .refine(insideRepo, insideRepoMessage)
         .default("."),
 })
-// Zod stamps a "$schema" key onto its output. Some providers reject unknown keys
-// in a tool's `parameters`, and the model never needs it, so drop it.
-// io:"input" matters here: `parameters` describes what the model SENDS, and with
-// Zod's default io:"output" a .default() field is emitted as required.
+
 const toolParams = (schema: z.ZodType<any, any>) => {
     const { $schema, ...rest } = z.toJSONSchema(schema, { io: "input" }) as Record<string, unknown>
     return rest
@@ -185,48 +189,96 @@ const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [ {
         parameters: toolParams(ListFileSchema)
     }
 }]
-const messages:OpenAI.Chat.ChatCompletionMessageParam[] = [
-    {role: 'system',content:systemPrompt},
-    {role : 'user',content:issue},
-]
+// Two different events, kept apart on purpose. INVALID_CALL means the model
+// built the call wrong and should retry it. ERROR means the call was well formed
+// and the repository answered no, which is a fact about the repository and not
+// something a retry fixes.
+const INVALID_CALL = "INVALID_CALL:"
+const TOOL_ERROR = "ERROR:"
 
-const searchCode =async (query:string): Promise<string> => {
-    
+// Line caps do nothing for a minified bundle or a one-line JSON blob, which is
+// still a single line no matter how many characters it holds. Cap both.
+const MAX_CHARS = 8_000
+
+const truncate = (lines: string[], cap: number, unit: string): string => {
+    const text = lines.slice(0, cap).join("\n")
+    if (text.length > MAX_CHARS) {
+        return `${text.slice(0, MAX_CHARS)}\n... truncated at ${MAX_CHARS} characters`
+    }
+    return text + (lines.length > cap ? `\n... ${lines.length - cap} more ${unit} not shown` : "")
+}
+
+// execFile sets `code` to a string like "ENOENT" when the binary itself could
+// not be spawned, and to a numeric exit status when it ran and failed. A missing
+// binary is neither an invalid call nor a fact about the repository: the model
+// cannot act on it, and handing it over burns the turn budget on retries that
+// cannot work. Fail loudly instead.
+const assertSpawned = (error: unknown, binary: string): void => {
+    const code = (error as NodeJS.ErrnoException).code
+    if (typeof code === "string") {
+        throw new Error(`${binary} could not be run (${code}). Is it installed and on PATH?`)
+    }
+}
+
+// execFile keeps the shell out of it, which stops metacharacters but does
+// nothing about argument injection: a value in flag position is still read as a
+// flag. `-e` pins the model's query to the pattern slot, and `--` ends flag
+// parsing before the path. Without `-e`, a query of "--pre=/tmp/x" is a ripgrep
+// flag that runs a program of the model's choosing against every file scanned.
+const searchCode = async (query: string): Promise<string> => {
     try {
-        const {stdout} = await run("rg",["--files-with-matches","--hidden", query,"."],{cwd:repoPath})
-        const lines = stdout.trim().split("\n")
-        const shown = lines.slice(0, 20)
-        return shown.join("\n") +
-            (lines.length > 20 ? `\n... ${lines.length - 20} more files not shown` : "")
+        const { stdout } = await run(
+            "rg",
+            ["--files-with-matches", "--hidden", "-e", query, "--", "."],
+            { cwd: repoPath },
+        )
+        const lines = stdout.trim().split("\n").filter(Boolean)
+        if (lines.length === 0) return `(no files matched: ${query})`
+        return truncate(lines, 20, "files")
     } catch (error) {
-        return `ERROR: no files matched: ${query}`
+        assertSpawned(error, "rg")
+        // rg exits 1 for "no matches" and 2 for a real failure such as an
+        // unparseable regex. Collapsing the two tells the model the concept is
+        // absent from the repository when in fact its own pattern was broken.
+        const { code, stderr } = error as { code?: number; stderr?: string }
+        if (code === 1) return `(no files matched: ${query})`
+        const detail = (stderr ?? String(error)).trim()
+        return `${INVALID_CALL} search_code could not run that pattern: ${detail}`
     }
 }
 
 const listFiles = async (path: string = "."): Promise<string> => {
     try {
-        const { stdout } = await run("ls", ["-1p", path], { cwd: repoPath })
-        const lines = stdout.trim().split("\n")
-        const shown = lines.slice(0, 100)
-        return shown.join("\n") +
-            (lines.length > 100 ? `\n... ${lines.length - 100} more entries not shown` : "")
+        const { stdout } = await run("ls", ["-1p", "--", path], { cwd: repoPath })
+        const lines = stdout.trim().split("\n").filter(Boolean)
+        if (lines.length === 0) return `(empty directory: ${path})`
+        return truncate(lines, 100, "entries")
     } catch (error) {
-        return `ERROR: no such directory: ${path}`
+        assertSpawned(error, "ls")
+        const detail = ((error as { stderr?: string }).stderr ?? String(error)).trim()
+        if (/No such file or directory/.test(detail)) return `${TOOL_ERROR} no such directory: ${path}`
+        if (/Permission denied/.test(detail)) return `${TOOL_ERROR} permission denied: ${path}`
+        return `${TOOL_ERROR} could not list ${path}: ${detail}`
     }
 }
 
-const readFileTool = async(path:string):Promise<string> =>{
+const readFileTool = async (path: string): Promise<string> => {
     try {
-        const fullPath = join(repoPath,path)
-        const readPath = await readFile(fullPath,"utf-8")
-        const lines = readPath.split("\n")
-        const shown = lines.slice(0, 100)
-        return shown.join("\n") +
-            (lines.length > 100 ? `\n... ${lines.length - 100} more lines not shown` : "")
+        const contents = await readFile(join(repoPath, path), "utf-8")
+        if (contents.trim() === "") return `(empty file: ${path})`
+        return truncate(contents.split("\n"), 100, "lines")
     } catch (error) {
-        return `ERROR: no such file: ${path}`
+        // ENOENT, EISDIR and EACCES are three different facts about the
+        // repository. Reporting all of them as "no such file" makes the model
+        // confidently wrong about what exists.
+        const code = (error as NodeJS.ErrnoException).code
+        if (code === "ENOENT") return `${TOOL_ERROR} no such file: ${path}`
+        if (code === "EISDIR") return `${TOOL_ERROR} that path is a directory, not a file: ${path}`
+        if (code === "EACCES") return `${TOOL_ERROR} permission denied: ${path}`
+        return `${TOOL_ERROR} could not read ${path}: ${code ?? String(error)}`
     }
 }
+
 // The model's `arguments` is a string it generated token by token: it may not be
 // JSON at all, and if it is, nothing guarantees the shape. Validate here, at the
 // boundary, and hand any failure back to the model as a tool result so it can
@@ -234,13 +286,13 @@ const readFileTool = async(path:string):Promise<string> =>{
 const withArgs = async <T>(
     schema: z.ZodType<T, any>,
     raw: string,
-    run: (args: T) => Promise<string>,
+    invoke: (args: T) => Promise<string>,
 ): Promise<string> => {
     let json: unknown
     try {
         json = JSON.parse(raw)
     } catch {
-        return `ERROR: arguments were not valid JSON: ${raw}`
+        return `${INVALID_CALL} arguments were not valid JSON: ${raw}`
     }
 
     const parsed = schema.safeParse(json)
@@ -248,90 +300,109 @@ const withArgs = async <T>(
         const issues = parsed.error.issues
             .map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
             .join("; ")
-        return `ERROR: invalid arguments: ${issues}`
+        return `${INVALID_CALL} invalid arguments: ${issues}`
     }
 
-    return run(parsed.data)
+    return invoke(parsed.data)
 }
 
 const MAX_TURNS = 10
 const WARN_AT = 3
 const PACE_MS = 13_000
 
-const sleep = (ms:number) => new Promise(r => setTimeout(r, ms))
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
-let answered = false;
-for (let i = 0; i < MAX_TURNS; i++) {
-    const turnsLeft = MAX_TURNS - 1 - i
-    const isLastTurn = turnsLeft === 0
+export const runAgent = async (issueText: string = issue): Promise<string | null> => {
+    const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: issueText },
+    ]
 
-    if (turnsLeft === WARN_AT) {
-        messages.push({
-            role: "user",
-            content: `You have ${WARN_AT} tool calls left. Start narrowing down and be ready to answer.`,
+    for (let i = 0; i < MAX_TURNS; i++) {
+        const turnsLeft = MAX_TURNS - 1 - i
+        const isLastTurn = turnsLeft === 0
+
+        if (turnsLeft === WARN_AT) {
+            messages.push({
+                role: "user",
+                content: `You have ${WARN_AT} tool calls left. Start narrowing down and be ready to answer.`,
+            })
+        }
+        if (isLastTurn) {
+            messages.push({
+                role: "user",
+                content: "No tool calls remain. Answer now with what you have found so far. " +
+                    "If something is still unconfirmed, say so plainly rather than guessing.",
+            })
+        }
+
+        if (i > 0) {
+            await sleep(PACE_MS)
+        }
+
+        console.log(`[${i}] calling model...${isLastTurn ? " (final, no tools)" : ""}`)
+        const response = await client.chat.completions.create({
+            model: MODEL,
+            messages,
+            ...(isLastTurn ? {} : { tools }),
         })
-    }
-    if (isLastTurn) {
-        messages.push({
-            role: "user",
-            content: "No tool calls remain. Answer now with what you have found so far. " +
-                "If something is still unconfirmed, say so plainly rather than guessing.",
-        })
+        const message = response.choices[0]?.message
+        if (!message) {
+            throw new Error("no message in response")
+        }
+        messages.push(message)
+
+        // An empty tool_calls array is truthy, so testing the array itself burns
+        // a turn on a message that adds nothing to the conversation.
+        const calls = message.tool_calls ?? []
+        if (calls.length === 0) {
+            console.log(message.content)
+            return message.content ?? null
+        }
+
+        for (const call of calls) {
+            // Every tool_call needs a matching tool result. Skipping one leaves
+            // an assistant message the API rejects on the next request.
+            if (call.type !== "function") {
+                messages.push({
+                    role: "tool",
+                    tool_call_id: call.id,
+                    content: `${INVALID_CALL} unsupported tool call type: ${call.type}`,
+                })
+                continue
+            }
+
+            const name = call.function.name
+            const raw = call.function.arguments
+
+            const result =
+                name === "search_code" ? await withArgs(SearchCodeSchema, raw, (a) => searchCode(a.query))
+                : name === "read_file" ? await withArgs(ReadFileSchema, raw, (a) => readFileTool(a.path))
+                : name === "list_files" ? await withArgs(ListFileSchema, raw, (a) => listFiles(a.path))
+                : `${INVALID_CALL} unknown tool ${name}`
+
+            const outcome = result.startsWith(INVALID_CALL)
+                ? "invalid_call"
+                : result.startsWith(TOOL_ERROR)
+                  ? "tool_error"
+                  : "ok"
+            const summary = outcome === "ok" ? `${result.split("\n").length} lines` : result
+            console.log(`[${i}] ${outcome} ${name}(${raw}) -> ${summary}`)
+
+            messages.push({
+                role: "tool",
+                tool_call_id: call.id,
+                content: result,
+            })
+        }
     }
 
-    if (i > 0) {
-        await sleep(PACE_MS)
-    }
-
-    console.log(`[${i}] calling model...${isLastTurn ? " (final, no tools)" : ""}`);
-    const response = await client.chat.completions.create({
-        model: MODEL,
-        messages,
-        ...(isLastTurn ? {} : { tools }),
-    })
-    const message = response.choices[0]?.message
-    if(!message){
-        throw new Error("no message in response")
-    }
-    messages.push(message)
-    if(!message.tool_calls){
-        console.log(message.content);
-        answered = true;
-        break
-        
-    }
-  
-    for (const call of message.tool_calls) {
-        if (call.type !== "function") continue;
-        const name = call.function.name
-        const raw = call.function.arguments
-
-        const result =
-        name === "search_code" ? await withArgs(SearchCodeSchema, raw, (a) => searchCode(a.query))
-        : name === "read_file" ? await withArgs(ReadFileSchema, raw, (a) => readFileTool(a.path))
-        : name === "list_files" ? await withArgs(ListFileSchema, raw, (a) => listFiles(a.path))
-        : `ERROR: unknown tool ${name}`
-
-        const summary = result.startsWith("ERROR:")
-            ? result
-            : `${result.split("\n").length} lines`
-        console.log(`[${i}] ${name}(${raw}) -> ${summary}`);      
-        messages.push({
-          role: "tool",
-          tool_call_id: call.id,
-          content: result,
-        });
-      }
-      
-}
-if (!answered) {
-    console.log("ran out of turns without answering");
+    console.log("ran out of turns without answering")
+    return null
 }
 
-
-
-
-
-
-
-
+// Only run the loop when this file is the entry point, so it can also be
+// imported and driven more than once.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+    await runAgent()
+}
