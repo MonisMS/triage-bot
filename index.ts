@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import OpenAI from 'openai';
 import { join } from 'node:path';
+import { z } from 'zod';
 
 const run = promisify(execFile)
 
@@ -109,22 +110,60 @@ you would need to look at next.`
 
 
 
+// A path the model supplies must stay inside repoPath. `cwd` does not enforce
+// this: `ls ../..` resolves relative to cwd and walks straight out of the repo,
+// and join(repoPath, "../..") does the same. Neither TypeScript nor JSON Schema
+// can express this, so it lives in a refinement that runs on our side.
+const insideRepo = (p: string) => !p.split(/[\\/]/).includes("..")
+const insideRepoMessage = "path must stay inside the repository: no '..' segments"
+
+const SearchCodeSchema = z.object({
+    query: z
+        .string()
+        .min(1, "query must not be empty")
+        .describe(
+            "Case-sensitive regex to match against file contents, e.g. 'defineIntegration' or 'zod'."
+        ),
+})
+
+const ReadFileSchema = z.object({
+    path: z
+        .string()
+        .min(1, "path must not be empty")
+        .describe(
+            "Path to the file, relative to the repository root, e.g. 'package.json' or 'packages/stripe/src/index.ts'."
+        )
+        .refine(insideRepo, insideRepoMessage),
+})
+
+const ListFileSchema = z.object({
+    path: z
+        .string()
+        .describe(
+            "Directory relative to the repository root, e.g. 'packages' or 'packages/affinda'. Omit to list from the repository root."
+        )
+        .refine(insideRepo, insideRepoMessage)
+        .default("."),
+})
+// Zod stamps a "$schema" key onto its output. Some providers reject unknown keys
+// in a tool's `parameters`, and the model never needs it, so drop it.
+// io:"input" matters here: `parameters` describes what the model SENDS, and with
+// Zod's default io:"output" a .default() field is emitted as required.
+const toolParams = (schema: z.ZodType<any, any>) => {
+    const { $schema, ...rest } = z.toJSONSchema(schema, { io: "input" }) as Record<string, unknown>
+    return rest
+}
+
 const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [ {
+
+
     type : "function",
     function:{
         name:"search_code",
         description: "Search the repository for a regex pattern and return the paths of files that contain it. " +
         "Returns file paths only, not matching lines, capped at 20 results. " +
         "Use this to find where a concept lives before recommending files to the developer.",
-        parameters:{
-            type : "object",
-            properties:{
-                query:{type :"string",description:"Case-sensitive regex to match against file contents, e.g. 'defineIntegration' or 'zod'.",
-
-                }
-            },
-            required :["query"]
-        }
+        parameters: toolParams(SearchCodeSchema)
     }
 },{
     type: "function",
@@ -133,15 +172,7 @@ const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [ {
         description: "Read a file from the repository and return its first 100 lines. " +
         "Takes a path relative to the repository root. " +
         "Use this after search_code to confirm what a file actually contains before recommending it.",
-        parameters:{
-            type:"object",
-            properties:{
-                path:{type:"string",description:"Path to the file, relative to the repository root, e.g. 'package.json' or 'packages/stripe/src/index.ts'.",
-
-                }
-            },
-            required:["path"]
-        }
+        parameters: toolParams(ReadFileSchema)
 
     }
 },{
@@ -151,13 +182,7 @@ const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [ {
         description: "List file paths in the repository, optionally under a given directory. " +
         "Does not search file contents. Capped at 100 results. " +
         "Use this first to understand the repository's layout before searching or reading.",
-        parameters:{
-            type:"object",
-            properties:{
-                path:{type:"string",description:"Directory relative to the repository root, e.g. 'packages' or 'packages/affinda'. Omit to list from the repository root."}
-            },
-            required:[]
-        }
+        parameters: toolParams(ListFileSchema)
     }
 }]
 const messages:OpenAI.Chat.ChatCompletionMessageParam[] = [
@@ -202,6 +227,33 @@ const readFileTool = async(path:string):Promise<string> =>{
         return `ERROR: no such file: ${path}`
     }
 }
+// The model's `arguments` is a string it generated token by token: it may not be
+// JSON at all, and if it is, nothing guarantees the shape. Validate here, at the
+// boundary, and hand any failure back to the model as a tool result so it can
+// correct itself on the next turn rather than crashing the run.
+const withArgs = async <T>(
+    schema: z.ZodType<T, any>,
+    raw: string,
+    run: (args: T) => Promise<string>,
+): Promise<string> => {
+    let json: unknown
+    try {
+        json = JSON.parse(raw)
+    } catch {
+        return `ERROR: arguments were not valid JSON: ${raw}`
+    }
+
+    const parsed = schema.safeParse(json)
+    if (!parsed.success) {
+        const issues = parsed.error.issues
+            .map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
+            .join("; ")
+        return `ERROR: invalid arguments: ${issues}`
+    }
+
+    return run(parsed.data)
+}
+
 const MAX_TURNS = 10
 const WARN_AT = 3
 const PACE_MS = 13_000
@@ -251,18 +303,19 @@ for (let i = 0; i < MAX_TURNS; i++) {
   
     for (const call of message.tool_calls) {
         if (call.type !== "function") continue;
-        const args = JSON.parse(call.function.arguments);
         const name = call.function.name
-        const result = 
-        name === "search_code" ? await searchCode(args.query)
-        : name === "read_file" ? await readFileTool(args.path)
-        : name === "list_files" ? await listFiles(args.path)
-        : `unknown tool ${name}`
+        const raw = call.function.arguments
+
+        const result =
+        name === "search_code" ? await withArgs(SearchCodeSchema, raw, (a) => searchCode(a.query))
+        : name === "read_file" ? await withArgs(ReadFileSchema, raw, (a) => readFileTool(a.path))
+        : name === "list_files" ? await withArgs(ListFileSchema, raw, (a) => listFiles(a.path))
+        : `ERROR: unknown tool ${name}`
 
         const summary = result.startsWith("ERROR:")
             ? result
             : `${result.split("\n").length} lines`
-        console.log(`[${i}] ${name}(${JSON.stringify(args)}) -> ${summary}`);      
+        console.log(`[${i}] ${name}(${raw}) -> ${summary}`);      
         messages.push({
           role: "tool",
           tool_call_id: call.id,

@@ -16,7 +16,8 @@
   "packageManager": "pnpm@10.34.5",
   "dependencies": {
     "dotenv": "^17.4.2",
-    "openai": "^7.10.0"
+    "openai": "^7.10.0",
+    "zod": "^4.6.1"
   },
   "devDependencies": {
     "@types/node": "^26.5.0",
