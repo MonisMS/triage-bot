@@ -201,11 +201,19 @@ const TOOL_ERROR = "ERROR:"
 const MAX_CHARS = 8_000
 
 const truncate = (lines: string[], cap: number, unit: string): string => {
-    const text = lines.slice(0, cap).join("\n")
+    const kept = lines.slice(0, cap)
+    const text = kept.join("\n")
+    const droppedLines = lines.length - kept.length
+
     if (text.length > MAX_CHARS) {
-        return `${text.slice(0, MAX_CHARS)}\n... truncated at ${MAX_CHARS} characters`
+        // Say how much was cut here too. Without a count the model cannot tell a
+        // file it has seen in full from one it has seen the first 8k of.
+        const droppedChars = text.length - MAX_CHARS
+        const andLines = droppedLines > 0 ? `, then ${droppedLines} more ${unit}` : ""
+        return `${text.slice(0, MAX_CHARS)}\n... truncated at ${MAX_CHARS} characters: ${droppedChars} more characters${andLines} not shown`
     }
-    return text + (lines.length > cap ? `\n... ${lines.length - cap} more ${unit} not shown` : "")
+
+    return text + (droppedLines > 0 ? `\n... ${droppedLines} more ${unit} not shown` : "")
 }
 
 // execFile sets `code` to a string like "ENOENT" when the binary itself could
